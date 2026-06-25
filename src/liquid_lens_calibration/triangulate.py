@@ -6,15 +6,32 @@ import cv2
 
 from liquid_lens_calibration.calibration_io import CameraCalibration
 
-_detector_cache: dict[int, cv2.aruco.ArucoDetector] = {}
+_detector_cache: dict[tuple[int, bool], cv2.aruco.ArucoDetector] = {}
 
 
-def _get_detector(dictionary_type: int) -> cv2.aruco.ArucoDetector:
-    if dictionary_type not in _detector_cache:
+def _get_detector(
+    dictionary_type: int,
+    robust: bool = False,
+) -> cv2.aruco.ArucoDetector:
+    key = (dictionary_type, robust)
+    if key not in _detector_cache:
         d = cv2.aruco.getPredefinedDictionary(dictionary_type)
         p = cv2.aruco.DetectorParameters()
-        _detector_cache[dictionary_type] = cv2.aruco.ArucoDetector(d, p)
-    return _detector_cache[dictionary_type]
+        if robust:
+            # Larger adaptive-threshold windows tolerate blur and defocus.
+            # Finer step means more threshold candidates are tried.
+            # Higher error-correction rate accepts partially corrupted bits.
+            # Lower min-perimeter rate allows detection even when the tag is
+            # small or occupies only part of the frame.
+            p.adaptiveThreshWinSizeMin = 3
+            p.adaptiveThreshWinSizeMax = 53
+            p.adaptiveThreshWinSizeStep = 4
+            p.adaptiveThreshConstant = 7
+            p.errorCorrectionRate = 0.9
+            p.minMarkerPerimeterRate = 0.01
+            p.perspectiveRemovePixelPerCell = 8
+        _detector_cache[key] = cv2.aruco.ArucoDetector(d, p)
+    return _detector_cache[key]
 
 
 TAG_FAMILIES: dict[str, int] = {
@@ -88,18 +105,21 @@ def dlt_triangulate(
 def detect_apriltags(
     gray: npt.NDArray[np.uint8],
     dictionary_type: int = cv2.aruco.DICT_APRILTAG_36H11,
+    robust: bool = False,
 ) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.int32] | None]:
     """Detect markers in a grayscale image.
 
     Args:
         gray: Grayscale image.
         dictionary_type: OpenCV aruco dictionary constant.
+        robust: Use tuned parameters for blurry / defocused images (XIMEA
+            coarse sweep). Slightly slower, more permissive.
 
     Returns:
         ``(corners_list, ids)`` where each corner array has shape ``(4, 2)``.
         ``ids`` is ``None`` when no markers are detected.
     """
-    corners, ids, _ = _get_detector(dictionary_type).detectMarkers(gray)
+    corners, ids, _ = _get_detector(dictionary_type, robust=robust).detectMarkers(gray)
     return corners, ids
 
 

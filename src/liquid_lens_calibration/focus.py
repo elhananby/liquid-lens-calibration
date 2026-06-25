@@ -292,6 +292,18 @@ def sweep_all_tags(
     per_tag_roi: dict[int, tuple[int, int, int, int]] = {}
     per_tag_meas: dict[int, list[tuple[float, float]]] = defaultdict(list)
 
+    # CLAHE equaliser — created once, applied to every frame before detection.
+    # Normalises local contrast so the tag border remains detectable even when
+    # the overall image is defocused or unevenly lit.
+    _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def _detect_ximea(
+        frame: npt.NDArray[np.uint8],
+    ) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.int32] | None]:
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        enhanced = _clahe.apply(gray)
+        return detect_apriltags(enhanced, dictionary_type, robust=True)
+
     # --- Coarse sweep ---
     # In debug mode, save one downscaled frame every N steps so the user can
     # see what the XIMEA actually sees across the diopter range.
@@ -312,7 +324,7 @@ def sweep_all_tags(
             frame_path = out_dir / f"ximea_{ts}_step{_step_i:02d}_{d:+.2f}D.jpg"
             cv2.imwrite(str(frame_path), small)
 
-        corners_list, ids = detect_apriltags(frame, dictionary_type)
+        corners_list, ids = _detect_ximea(frame)
         seen_this_step: set[int] = set()
 
         if ids is not None:
