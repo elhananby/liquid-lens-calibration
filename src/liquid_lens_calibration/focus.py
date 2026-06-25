@@ -11,6 +11,25 @@ import cv2
 
 from liquid_lens_calibration.triangulate import detect_apriltags, TAG_FAMILIES
 
+PREVIEW_WIN = "XIMEA Live"
+
+
+def show_preview(frame: npt.NDArray[np.uint8], text: str = "") -> None:
+    """Update the live preview window with a half-resolution frame and text overlay.
+
+    Call ``cv2.waitKey(1)`` after this to process GUI events.
+    """
+    h, w = frame.shape[:2]
+    small = cv2.resize(frame, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    if small.ndim == 2:
+        display = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    else:
+        display = small.copy()
+    if text:
+        cv2.putText(display, text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2, cv2.LINE_AA)
+    cv2.imshow(PREVIEW_WIN, display)
+
 
 def focus_metric(patch: npt.NDArray[np.uint8]) -> float:
     """Tenengrad focus metric (mean squared Sobel gradient magnitude).
@@ -252,6 +271,9 @@ def sweep_all_tags(
         frame = focus_cam.grab_full_frame()
         frame_h, frame_w = frame.shape[:2]
 
+        show_preview(frame, f"Coarse sweep  {d:+.2f} D  ({_step_i + 1}/{n_coarse})")
+        cv2.waitKey(1)
+
         if debug and _step_i % _debug_save_every == 0:
             small = cv2.resize(frame, (frame_w // 2, frame_h // 2),
                                interpolation=cv2.INTER_AREA)
@@ -306,14 +328,21 @@ def sweep_all_tags(
         ds_f: list[float] = []
         ms_f: list[float] = []
         peak_frame: npt.NDArray[np.uint8] | None = None
-        for d in np.linspace(fine_min, fine_max, n_fine):
+        best_m_so_far = -1.0
+        for _step_j, d in enumerate(np.linspace(fine_min, fine_max, n_fine)):
             lens.set_diopter(float(d))
             time.sleep(settle_s)
             patch = focus_cam.grab_roi_frame(roi)
             ds_f.append(float(d))
-            ms_f.append(focus_metric(patch))
-            if len(ms_f) == 1 or ms_f[-1] >= max(ms_f[:-1]):
+            m = focus_metric(patch)
+            ms_f.append(m)
+            if m >= best_m_so_far:
+                best_m_so_far = m
                 peak_frame = patch
+            show_preview(patch,
+                         f"Fine sweep  tag {tag_id}  {d:+.2f} D  "
+                         f"({_step_j + 1}/{n_fine})  metric={m:.0f}")
+            cv2.waitKey(1)
 
         fine_peak_idx = int(np.argmax(ms_f))
         best_d = _find_peak(ds_f, ms_f, fine_peak_idx, d_min, d_max)

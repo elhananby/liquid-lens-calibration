@@ -13,6 +13,7 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -20,8 +21,25 @@ from liquid_lens_calibration.calibration_io import parse_calibration_xml
 from liquid_lens_calibration.cameras import discover_basler_cameras, grab_frame, flush_buffers as flush_basler
 from liquid_lens_calibration.focus_camera import XimeaFocusCamera
 from liquid_lens_calibration.triangulate import detect_and_triangulate, TAG_FAMILIES
-from liquid_lens_calibration.focus import sweep_all_tags
+from liquid_lens_calibration.focus import sweep_all_tags, show_preview, PREVIEW_WIN
 from liquid_lens_calibration.lens import open_lens
+
+
+def _live_wait(focus_cam: XimeaFocusCamera) -> str:
+    """Show a live XIMEA preview and wait for a keypress in the preview window.
+
+    Returns ``'measure'`` (Enter) or ``'quit'`` (Q / Escape).
+    The terminal prompt is printed once; subsequent interaction is via the window.
+    """
+    print("  [preview window]  Enter = measure    Q = quit", flush=True)
+    while True:
+        frame = focus_cam.grab_full_frame()
+        show_preview(frame, "Enter = measure    Q = quit")
+        key = cv2.waitKey(30)
+        if key in (13, 10):        # Enter
+            return "measure"
+        if key in (ord("q"), ord("Q"), 27):  # q / Q / Esc
+            return "quit"
 
 
 def vergence_model(z: np.ndarray, a: float, z0: float, b: float) -> np.ndarray:
@@ -109,6 +127,7 @@ def main() -> None:
 
     try:
         with XimeaFocusCamera(exposure_us=args.exposure) as focus_cam, lens:
+            cv2.namedWindow(PREVIEW_WIN, cv2.WINDOW_NORMAL)
             print(f"Optotune lens diopter range: {d_min:.2f} to {d_max:.2f} D")
             print(f"Coarse steps: {args.coarse_steps}  Fine steps: {args.fine_steps}")
             print(f"Tags within {args.z_thresh * 1000:.0f} mm z-spread → coplanar (z fused)")
@@ -120,12 +139,11 @@ def main() -> None:
             print("  Place AprilTag(s), then press Enter to measure.")
             print("  Multiple tags at different heights → one data point each.")
             print("  Multiple tags at similar height → fused z, one data point.")
-            print("  Type 'q' then Enter to quit.")
+            print("  Keys are read from the preview window (click it first).")
             print("=" * 60)
 
             while True:
-                cmd = input("\nTarget(s) in position? [Enter=measure, q=quit] ").strip()
-                if cmd.lower() in ("q", "quit", "exit"):
+                if _live_wait(focus_cam) == "quit":
                     break
 
                 # Flush all camera buffers
@@ -244,6 +262,7 @@ def main() -> None:
                 print(f"  Total data points collected: {len(dataset)}")
 
     finally:
+        cv2.destroyAllWindows()
         for cam in basler_cameras.values():
             try:
                 cam.Close()
