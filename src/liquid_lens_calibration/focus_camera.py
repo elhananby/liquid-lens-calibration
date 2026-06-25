@@ -22,17 +22,21 @@ class XimeaFocusCamera:
     def __init__(self, exposure_us: int = 10000) -> None:
         self._exposure_us = exposure_us
         self._cam: xiapi.Camera | None = None
+        self._buffer_minimised: bool = False
 
     def __enter__(self) -> "XimeaFocusCamera":
         self._cam = xiapi.Camera()
         self._cam.open_device()
         self._cam.set_gain(0.0)
         self._cam.set_exposure(self._exposure_us)
-        # Minimise buffer queue for newest-frame reads
+        # Minimise buffer queue so grab always returns the newest frame.
+        # buffers_queue_size is in frames; acq_buffer_size is in bytes (wrong param).
+        self._buffer_minimised = False
         try:
-            self._cam.set_acq_buffer_size(1)
+            self._cam.set_buffers_queue_size(1)
+            self._buffer_minimised = True
         except Exception:
-            pass  # not all xiAPI versions expose this; fallback to throwaway
+            pass  # fallback: flush manually before each grab
         self._cam.start_acquisition()
         return self
 
@@ -63,12 +67,13 @@ class XimeaFocusCamera:
     def _grab_newest_frame(self) -> npt.NDArray[np.uint8]:
         """Grab the newest available frame.
 
-        If buffer-size=1 was set, this reads the single buffered frame.
-        Otherwise we grab-and-discard a few frames to flush, then grab.
+        If buffers_queue_size=1 was set successfully, the single buffered frame
+        is already the newest. Otherwise flush a few stale frames first.
         """
         if self._cam is None:
             raise RuntimeError("Camera not opened")
-        self.flush(n=3)
+        if not self._buffer_minimised:
+            self.flush(n=3)
         img = xiapi.Image()
         self._cam.get_image(img)
         return np.asarray(img.get_image_data_numpy(), dtype=np.uint8)
