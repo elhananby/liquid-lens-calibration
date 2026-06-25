@@ -241,11 +241,21 @@ def sweep_all_tags(
     per_tag_meas: dict[int, list[tuple[float, float]]] = defaultdict(list)
 
     # --- Coarse sweep ---
-    for d in np.linspace(d_min, d_max, n_coarse):
+    # In debug mode, save one downscaled frame every N steps so the user can
+    # see what the XIMEA actually sees across the diopter range.
+    _debug_save_every = max(1, n_coarse // 5)
+
+    for _step_i, d in enumerate(np.linspace(d_min, d_max, n_coarse)):
         lens.set_diopter(float(d))
         time.sleep(settle_s)
         frame = focus_cam.grab_full_frame()
         frame_h, frame_w = frame.shape[:2]
+
+        if debug and _step_i % _debug_save_every == 0:
+            small = cv2.resize(frame, (frame_w // 2, frame_h // 2),
+                               interpolation=cv2.INTER_AREA)
+            frame_path = out_dir / f"ximea_{ts}_step{_step_i:02d}_{d:+.2f}D.jpg"
+            cv2.imwrite(str(frame_path), small)
 
         corners_list, ids = detect_apriltags(frame, dictionary_type)
         seen_this_step: set[int] = set()
