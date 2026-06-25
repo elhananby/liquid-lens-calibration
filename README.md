@@ -13,6 +13,8 @@ multi-camera Basler rig to measure the true `z` of static AprilTag targets.
 
 Calibration data: `/home/nfc/braid-configs/calibration_charuco.xml`
 
+To generate an AprilTag sheet: [shiqiliu-67.github.io/apriltag-generator](https://shiqiliu-67.github.io/apriltag-generator/)
+
 ## Installation
 
 ```bash
