@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# debug folder
+debug/
+
+# calibration csvs
+lens_calib_*.csv
