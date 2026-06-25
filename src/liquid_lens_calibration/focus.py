@@ -12,6 +12,7 @@ import cv2
 from liquid_lens_calibration.triangulate import detect_apriltags, TAG_FAMILIES
 
 PREVIEW_WIN = "XIMEA Live"
+HYSTERESIS_THRESH = 0.1  # diopters — warn if the two fine-sweep directions disagree more than this
 
 
 def show_preview(frame: npt.NDArray[np.uint8], text: str = "") -> None:
@@ -173,31 +174,43 @@ def _save_debug_outputs(
     tag_id: int,
     ds_c: list[float],
     ms_c: list[float],
-    ds_f: list[float],
-    ms_f: list[float],
+    ds_hi2lo: list[float],
+    ms_hi2lo: list[float],
+    best_d_hi2lo: float,
+    ds_lo2hi: list[float],
+    ms_lo2hi: list[float],
+    best_d_lo2hi: float,
     best_d: float,
     peak_m: float,
     roi_patch: npt.NDArray[np.uint8],
     debug_dir: Path,
     timestamp: str,
 ) -> None:
-    """Save focus-curve plot and ROI crop for one tag."""
+    """Save focus-curve plot (coarse + both fine directions) and ROI crop for one tag."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     stem = f"debug_tag{tag_id}_{timestamp}"
+    hysteresis = abs(best_d_hi2lo - best_d_lo2hi)
 
-    # --- Focus curve plot ---
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(ds_c, ms_c, "o-", color="steelblue", markersize=4, label="coarse")
-    ax.plot(ds_f, ms_f, "s-", color="darkorange", markersize=4, label="fine")
-    ax.axvline(best_d, color="red", linestyle="--", linewidth=1.5,
-               label=f"best = {best_d:.3f} D")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(ds_c,      ms_c,      "o-", color="steelblue",  markersize=4, label="coarse")
+    ax.plot(ds_hi2lo,  ms_hi2lo,  "s-", color="darkorange", markersize=4, label="fine ↓ (hi→lo)")
+    ax.plot(ds_lo2hi,  ms_lo2hi,  "^-", color="seagreen",   markersize=4, label="fine ↑ (lo→hi)")
+    ax.axvline(best_d_hi2lo, color="darkorange", linestyle=":", linewidth=1.2,
+               label=f"↓ peak = {best_d_hi2lo:.3f} D")
+    ax.axvline(best_d_lo2hi, color="seagreen",   linestyle=":", linewidth=1.2,
+               label=f"↑ peak = {best_d_lo2hi:.3f} D")
+    ax.axvline(best_d, color="red", linestyle="--", linewidth=1.8,
+               label=f"avg = {best_d:.3f} D  (Δ={hysteresis:.3f})")
     ax.set_xlabel("Diopter (D)")
     ax.set_ylabel("Focus metric (Tenengrad)")
-    ax.set_title(f"Tag {tag_id}  —  best focus {best_d:.3f} D  (peak metric {peak_m:.1f})")
-    ax.legend()
+    ax.set_title(
+        f"Tag {tag_id}  —  best {best_d:.3f} D  "
+        f"(Δ hysteresis = {hysteresis:.3f} D{'  ⚠' if hysteresis > HYSTERESIS_THRESH else ''})"
+    )
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     plot_path = debug_dir / f"{stem}_curve.png"
@@ -205,7 +218,6 @@ def _save_debug_outputs(
     plt.close(fig)
     print(f"    [debug] curve  → {plot_path}")
 
-    # --- ROI crop ---
     roi_path = debug_dir / f"{stem}_roi.jpg"
     cv2.imwrite(str(roi_path), roi_patch)
     print(f"    [debug] ROI    → {roi_path}")
@@ -325,34 +337,74 @@ def sweep_all_tags(
         fine_min = max(d_min, coarse_peak_d - fine_half)
         fine_max = min(d_max, coarse_peak_d + fine_half)
 
-        ds_f: list[float] = []
-        ms_f: list[float] = []
+        # Fine sweep pass 1: high → low diopter
+        ds_hi2lo: list[float] = []
+        ms_hi2lo: list[float] = []
         peak_frame: npt.NDArray[np.uint8] | None = None
         best_m_so_far = -1.0
-        for _step_j, d in enumerate(np.linspace(fine_min, fine_max, n_fine)):
+        for _step_j, d in enumerate(np.linspace(fine_max, fine_min, n_fine)):
             lens.set_diopter(float(d))
             time.sleep(settle_s)
             patch = focus_cam.grab_roi_frame(roi)
-            ds_f.append(float(d))
+            ds_hi2lo.append(float(d))
             m = focus_metric(patch)
-            ms_f.append(m)
+            ms_hi2lo.append(m)
             if m >= best_m_so_far:
                 best_m_so_far = m
                 peak_frame = patch
             show_preview(patch,
-                         f"Fine sweep  tag {tag_id}  {d:+.2f} D  "
+                         f"Fine ↓  tag {tag_id}  {d:+.2f} D  "
                          f"({_step_j + 1}/{n_fine})  metric={m:.0f}")
             cv2.waitKey(1)
 
-        fine_peak_idx = int(np.argmax(ms_f))
-        best_d = _find_peak(ds_f, ms_f, fine_peak_idx, d_min, d_max)
-        peak_m = float(ms_f[fine_peak_idx])
+        # Short pause between directions
+        time.sleep(max(settle_s * 5, 0.3))
 
-        results[tag_id] = (best_d, peak_m, 0.0, ds_c + ds_f, ms_c + ms_f)
+        # Fine sweep pass 2: low → high diopter
+        ds_lo2hi: list[float] = []
+        ms_lo2hi: list[float] = []
+        for _step_j, d in enumerate(np.linspace(fine_min, fine_max, n_fine)):
+            lens.set_diopter(float(d))
+            time.sleep(settle_s)
+            patch = focus_cam.grab_roi_frame(roi)
+            ds_lo2hi.append(float(d))
+            m = focus_metric(patch)
+            ms_lo2hi.append(m)
+            if m >= best_m_so_far:
+                best_m_so_far = m
+                peak_frame = patch
+            show_preview(patch,
+                         f"Fine ↑  tag {tag_id}  {d:+.2f} D  "
+                         f"({_step_j + 1}/{n_fine})  metric={m:.0f}")
+            cv2.waitKey(1)
+
+        # Find peak for each direction, then compare and average
+        idx_hi2lo = int(np.argmax(ms_hi2lo))
+        best_d_hi2lo = _find_peak(ds_hi2lo, ms_hi2lo, idx_hi2lo, d_min, d_max)
+
+        idx_lo2hi = int(np.argmax(ms_lo2hi))
+        best_d_lo2hi = _find_peak(ds_lo2hi, ms_lo2hi, idx_lo2hi, d_min, d_max)
+
+        hysteresis = abs(best_d_hi2lo - best_d_lo2hi)
+        best_d = (best_d_hi2lo + best_d_lo2hi) / 2.0
+        peak_m = float(max(ms_hi2lo[idx_hi2lo], ms_lo2hi[idx_lo2hi]))
+
+        if hysteresis > HYSTERESIS_THRESH:
+            print(f"    [warn] tag {tag_id}: hysteresis {hysteresis:.3f} D "
+                  f"(↓{best_d_hi2lo:.3f}  ↑{best_d_lo2hi:.3f}) — averaging → {best_d:.3f} D")
+        else:
+            print(f"    tag {tag_id}: fine ↓{best_d_hi2lo:.3f}  ↑{best_d_lo2hi:.3f} D "
+                  f"(Δ{hysteresis:.3f}) → {best_d:.3f} D")
+
+        all_ds = ds_c + ds_hi2lo + ds_lo2hi
+        all_ms = ms_c + ms_hi2lo + ms_lo2hi
+        results[tag_id] = (best_d, peak_m, 0.0, all_ds, all_ms)
 
         if debug and peak_frame is not None:
             _save_debug_outputs(
-                tag_id, ds_c, ms_c, ds_f, ms_f,
+                tag_id, ds_c, ms_c,
+                ds_hi2lo, ms_hi2lo, best_d_hi2lo,
+                ds_lo2hi, ms_lo2hi, best_d_lo2hi,
                 best_d, peak_m, peak_frame, out_dir, ts,
             )
 
