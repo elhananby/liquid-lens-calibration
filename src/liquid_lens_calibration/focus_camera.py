@@ -33,7 +33,7 @@ class XimeaFocusCamera:
         # buffers_queue_size is in frames; acq_buffer_size is in bytes (wrong param).
         self._buffer_minimised = False
         try:
-            self._cam.set_buffers_queue_size(1)
+            self._cam.set_buffers_queue_size(2)
             self._buffer_minimised = True
         except Exception:
             pass  # fallback: flush manually before each grab
