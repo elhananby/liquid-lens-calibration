@@ -6,6 +6,16 @@ import cv2
 
 from liquid_lens_calibration.calibration_io import CameraCalibration
 
+TAG_FAMILIES: dict[str, int] = {
+    "36h11": cv2.aruco.DICT_APRILTAG_36H11,
+    "36h10": cv2.aruco.DICT_APRILTAG_36H10,
+    "25h9": cv2.aruco.DICT_APRILTAG_25H9,
+    "16h5": cv2.aruco.DICT_APRILTAG_16H5,
+    "4x4_50": cv2.aruco.DICT_4X4_50,
+    "4x4_100": cv2.aruco.DICT_4X4_100,
+    "6x6_250": cv2.aruco.DICT_6X6_250,
+}
+
 
 def undistort_pixel(
     pt: tuple[float, float],
@@ -66,16 +76,18 @@ def dlt_triangulate(
 
 def detect_apriltags(
     gray: npt.NDArray[np.uint8],
+    dictionary_type: int = cv2.aruco.DICT_APRILTAG_36H11,
 ) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.int32]]:
-    """Detect AprilTag markers (tag36h11) in a grayscale image.
+    """Detect markers in a grayscale image.
 
     Args:
         gray: Grayscale image.
+        dictionary_type: OpenCV aruco dictionary constant.
 
     Returns:
         ``(corners_list, ids)`` where each corner array has shape ``(4, 2)``.
     """
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+    dictionary = cv2.aruco.getPredefinedDictionary(dictionary_type)
     params = cv2.aruco.DetectorParameters()
     detector = cv2.aruco.ArucoDetector(dictionary, params)
     corners, ids, _ = detector.detectMarkers(gray)
@@ -85,52 +97,61 @@ def detect_apriltags(
 def detect_and_triangulate(
     frames: dict[str, npt.NDArray[np.uint8]],
     calibrations: dict[str, CameraCalibration],
-) -> tuple[float, float, float, int]:
-    """Detect an AprilTag in each camera frame and triangulate its 3D position.
+    tag_family: str = "36h11",
+) -> dict[int, tuple[float, float, float, int]]:
+    """Detect all markers in each camera frame and triangulate each one.
+
+    Every visible tag ID is triangulated independently using all cameras that
+    detected it. Tags seen by fewer than 2 calibrated cameras are skipped.
 
     Args:
         frames: ``{cam_id: grayscale_frame}``.
         calibrations: ``{cam_id: CameraCalibration}`` from the XML.
+        tag_family: Key into :data:`TAG_FAMILIES` (default ``"36h11"``).
 
     Returns:
-        ``(x, y, z, n_cameras)`` — triangulated world position and
-        number of cameras that successfully detected the tag.
+        ``{tag_id: (x, y, z, n_cameras)}`` — one entry per successfully
+        triangulated tag.
 
     Raises:
-        RuntimeError: If no camera detects exactly one tag.
+        RuntimeError: If no tag is seen by at least 2 calibrated cameras.
     """
-    pts_2d: list[npt.NDArray[np.float64]] = []
-    proj_mats: list[npt.NDArray[np.float64]] = []
+    dictionary_type = TAG_FAMILIES.get(tag_family, cv2.aruco.DICT_APRILTAG_36H11)
+
+    # Collect per-tag observations across all cameras
+    per_tag: dict[int, list[tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]] = {}
 
     for cam_id, gray in frames.items():
         cal = calibrations.get(cam_id)
         if cal is None:
             continue
 
-        corners, ids = detect_apriltags(gray)
-        if ids is None or len(ids) != 1:
+        corners_list, ids = detect_apriltags(gray, dictionary_type)
+        if ids is None:
             continue
 
-        # Tag center as pixel coordinate
-        corners_4 = corners[0].reshape(4, 2)
-        center = corners_4.mean(axis=0)
+        for i, tag_id in enumerate(ids.flatten()):
+            corners_4 = corners_list[i].reshape(4, 2)
+            center = corners_4.mean(axis=0)
+            pt_undistorted = undistort_pixel(
+                (float(center[0]), float(center[1])),
+                cal.intrinsics,
+                cal.distortion_coeffs,
+            )
+            per_tag.setdefault(int(tag_id), []).append(
+                (pt_undistorted, cal.calibration_matrix)
+            )
 
-        # Undistort (braid convention: undistort to pixel coords)
-        pt_undistorted = undistort_pixel(
-            (float(center[0]), float(center[1])),
-            cal.intrinsics,
-            cal.distortion_coeffs,
-        )
+    results: dict[int, tuple[float, float, float, int]] = {}
+    for tag_id, obs in per_tag.items():
+        if len(obs) < 2:
+            continue
+        xyz = dlt_triangulate([o[0] for o in obs], [o[1] for o in obs])
+        results[tag_id] = (float(xyz[0]), float(xyz[1]), float(xyz[2]), len(obs))
 
-        pts_2d.append(pt_undistorted)
-        proj_mats.append(cal.calibration_matrix)
-
-    n_cameras = len(pts_2d)
-    if n_cameras < 2:
+    if not results:
         raise RuntimeError(
-            f"Tag detected in only {n_cameras} camera(s); need at least 2"
+            f"No tag seen by ≥2 calibrated cameras (family={tag_family!r})"
         )
 
-    xyz = dlt_triangulate(pts_2d, proj_mats)
-    x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
-    return x, y, z, n_cameras
+    return results

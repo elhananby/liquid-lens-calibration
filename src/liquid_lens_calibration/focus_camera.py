@@ -74,27 +74,105 @@ class XimeaFocusCamera:
         return np.asarray(img.get_image_data_numpy(), dtype=np.uint8)
 
     def select_roi(self) -> tuple[int, int, int, int]:
-        """Grab a full preview frame and let the user draw the focus ROI.
+        """Show a live preview (~5 Hz) and let the user draw the focus ROI.
 
-        Uses ``cv2.selectROI``. The ROI is defined once at startup and
-        never changed afterward.
+        The preview displays at half resolution to fit the screen, but
+        returned coordinates are in full-resolution pixels.
+
+        Click-drag to draw a rectangle, then press SPACE/ENTER to confirm
+        or ESC to use the full frame.
 
         Returns:
-            ``(x, y, w, h)`` — OpenCV-style bounding box.
+            ``(x, y, w, h)`` — OpenCV-style bounding box, full-resolution.
         """
+        scale = 0.5
+        inv_scale = 2
+
+        # Shared state for the mouse callback
+        state: dict[str, int | bool] = {
+            "x1": -1, "y1": -1, "x2": -1, "y2": -1,
+            "drawing": False, "done": False, "confirmed": False,
+        }
+
+        def mouse_callback(event: int, x: int, y: int, flags: int, param: object) -> None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                state["drawing"] = True
+                state["x1"] = x
+                state["y1"] = y
+                state["x2"] = x
+                state["y2"] = y
+            elif event == cv2.EVENT_MOUSEMOVE and state["drawing"]:
+                state["x2"] = x
+                state["y2"] = y
+            elif event == cv2.EVENT_LBUTTONUP:
+                state["drawing"] = False
+                state["x2"] = x
+                state["y2"] = y
+
+        # Grab first frame: get dimensions and show it to create the window
+        # (Qt backend needs an imshow before setMouseCallback).
         frame = self._grab_newest_frame()
+        h_full, w_full = frame.shape[:2]
+        small_size = (int(w_full * scale), int(h_full * scale))
+
         if frame.ndim == 2:
             display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
             display = frame.copy()
-        roi = cv2.selectROI("Select focus region (press SPACE/ENTER when done)", display)
-        cv2.destroyWindow("Select focus region (press SPACE/ENTER when done)")
-        x, y, w, h = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
+        small = cv2.resize(display, small_size, interpolation=cv2.INTER_AREA)
+
+        win_name = "Select focus region - drag box, SPACE/ENTER to confirm, ESC full-frame"
+        cv2.namedWindow(win_name, cv2.WINDOW_GUI_NORMAL)
+        cv2.imshow(win_name, small)
+        cv2.waitKey(1)
+
+        cv2.setMouseCallback(win_name, mouse_callback)
+
+        while not state["done"]:
+            frame = self._grab_newest_frame()
+            if frame.ndim == 2:
+                display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            else:
+                display = frame.copy()
+            small = cv2.resize(display, small_size, interpolation=cv2.INTER_AREA)
+
+            # Draw the current selection rectangle
+            if state["x1"] >= 0 and state["y1"] >= 0:
+                cv2.rectangle(small,
+                              (state["x1"], state["y1"]),  # type: ignore[arg-type]
+                              (state["x2"], state["y2"]),  # type: ignore[arg-type]
+                              (0, 255, 0), 2)
+
+            cv2.imshow(win_name, small)
+            key = cv2.waitKey(200)  # ~5 Hz
+            if key in (13, 32):  # ENTER or SPACE
+                state["done"] = True
+                state["confirmed"] = True
+            elif key == 27:  # ESC
+                state["done"] = True
+
+        cv2.destroyWindow(win_name)
+
+        if (not state["confirmed"]
+                or state["x1"] < 0
+                or state["y1"] < 0
+                or state["x2"] < 0
+                or state["y2"] < 0):
+            return (0, 0, w_full, h_full)
+
+        x = min(state["x1"], state["x2"]) * inv_scale  # type: ignore[operator]
+        y = min(state["y1"], state["y2"]) * inv_scale  # type: ignore[operator]
+        w = abs(state["x2"] - state["x1"]) * inv_scale  # type: ignore[operator]
+        h = abs(state["y2"] - state["y1"]) * inv_scale  # type: ignore[operator]
+
         if w == 0 or h == 0:
-            # No ROI drawn — use full frame
-            h, w = frame.shape[:2]
-            return (0, 0, w, h)
+            return (0, 0, w_full, h_full)
+
         return (x, y, w, h)
+
+    def grab_full_frame(self) -> npt.NDArray[np.uint8]:
+        """Return the newest full XIMEA frame without any crop."""
+        return self._grab_newest_frame()
 
     def grab_roi_frame(self, roi: tuple[int, int, int, int]) -> npt.NDArray[np.uint8]:
         """Grab the newest frame and crop to the ROI.

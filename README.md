@@ -1,39 +1,101 @@
 # Liquid-Lens Focus Calibration Tool
 
 Builds a `z → diopter` lookup table for an Optotune liquid lens, using a
-multi-camera Basler rig to measure the true `z` of a static target.
+multi-camera Basler rig to measure the true `z` of static AprilTag targets.
+
+## Hardware
+
+| Device | Role |
+|--------|------|
+| 6× Basler cameras | Triangulate AprilTag `z` position |
+| XIMEA CB160CG-LX-X8G3 | Measure focus sharpness through the liquid lens |
+| Optotune liquid lens | Swept in focal-power (diopter) mode with temperature compensation |
+
+Calibration data: `/home/nfc/braid-configs/calibration_charuco.xml`
+
+## Installation
+
+```bash
+uv sync
+```
+
+The `optotune-lens` package is sourced from `../optotune-lens` (local path).
+Basler Pylon SDK and XIMEA xiAPI runtime must be installed system-wide.
 
 ## Usage
 
 ```bash
 uv run lens-calibrate [options]
-# or: uv run python -m liquid_lens_calibration.main [options]
 ```
-
-Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--exposure` | 10000 | XIMEA exposure in µs |
 | `--calibration` | `/home/nfc/braid-configs/calibration_charuco.xml` | Braid multi-camera calibration XML |
 | `--port` | `/dev/optotune_ld` | Optotune lens serial port |
-| `--steps` | 30 | Diopter sweep steps per measurement |
-| `--settle-ms` | 50 | Settle time after setting diopter |
+| `--exposure` | `10000` | XIMEA exposure in µs |
+| `--coarse-steps` | `20` | Steps in the full-range diopter sweep |
+| `--fine-steps` | `20` | Steps in the narrow fine sweep per tag |
+| `--settle-ms` | `50` | Wait after each diopter change (ms) |
+| `--z-thresh` | `0.02` | Max z-spread (m) to treat tags as coplanar |
+| `--tag-family` | `36h11` | AprilTag family (`36h11`, `25h9`, …) |
 
 ## Procedure
 
-1. Place an AprilTag (tag36h11) target below the cameras.
-2. Run the tool — it opens all cameras, loads calibration, asks you to draw
-   a focus ROI on the XIMEA preview.
-3. For each measurement: the tool flushes buffers, grabs Basler frames,
-   detects the tag, triangulates its position, sweeps the lens, and finds the
-   best-focus diopter by parabola fit.
-4. Move the target ~10–15 times, sampling uniformly in vergence (1/z).
-5. On quit, the tool fits `D = a/(z - z0) + b` and writes a timestamped CSV.
+### Target setup
 
-## Dependencies
+Use one or more AprilTag (family `36h11`) markers. Two modes are
+auto-detected based on the spread of triangulated z values:
 
-- Python ≥3.12
-- Basler Pylon SDK runtime (for `pypylon`)
-- XIMEA xiAPI runtime (for `ximea-py`)
-- Optotune lens driver (`optotune-lens` package at `../optotune-lens`)
+**Single-height mode** — all tags within `--z-thresh` of each other:
+- Z values are fused (weighted by number of cameras per tag).
+- One `(z, diopter)` data point is recorded per press of Enter.
+- Move the target to a new height and repeat (~10–15 positions for a good fit).
+
+**Multi-height mode** — tags span more than `--z-thresh` in z:
+- Each tag is triangulated and focused independently.
+- One `(z, diopter)` data point per tag per press of Enter.
+- Useful for a stacked multi-plane target: get N points in one interaction.
+
+### Session walkthrough
+
+1. Place the target(s) below the cameras.
+2. Run `uv run lens-calibrate`.
+3. Press **Enter** to measure, or **q** + Enter to quit.
+   - The Basler rig triangulates all visible tags.
+   - The lens performs a coarse sweep (full diopter range) while the XIMEA
+     camera auto-detects tags and builds per-tag focus ROIs.
+   - For each tag, a fine sweep refines the peak using Gaussian log-space
+     interpolation (Bonatti 2024, eq. 3.9).
+4. Repeat for as many positions as needed.
+5. On quit, the vergence model `D = a/(z − z₀) + b` is fitted and a
+   timestamped CSV is written.
+
+### Output
+
+CSV file: `lens_calib_YYYYMMDD_HHMMSS.csv`
+
+Columns: `z, diopter, x, y, n_cameras, n_tags, focus_metric_peak, timestamp`
+
+To interpolate diopter from `z` in real time, load the CSV and either
+re-fit the vergence model or use direct interpolation (e.g. `numpy.interp`).
+
+## Algorithm
+
+- **Focus metric**: variance of Laplacian-of-Gaussian (3×3 Gaussian blur → Laplacian).
+- **Peak finding**: Gaussian log-space 3-point interpolation for sub-step precision; parabola fit and argmax as fallbacks.
+- **Coarse sweep**: full diopter range, per-tag ROIs derived automatically from AprilTag detections in the XIMEA frame.
+- **Fine sweep**: ±2 coarse steps around each tag's coarse peak.
+- **Triangulation**: DLT with SVD using the 3×4 world→pixel projection matrices from the braid calibration XML; pixels are undistorted with OpenCV before triangulation.
+
+## Module layout
+
+```
+src/liquid_lens_calibration/
+├── main.py            CLI loop, CSV output, vergence model fit
+├── calibration_io.py  Parse braid XML → per-camera intrinsics + projection matrices
+├── cameras.py         Basler camera discovery, frame grab, buffer flush
+├── focus_camera.py    XIMEA camera (gain 0, user exposure, full/ROI frame grab)
+├── triangulate.py     AprilTag detection, undistortion, DLT triangulation
+├── focus.py           Focus metric, coarse+fine sweep, peak interpolation
+└── lens.py            Optotune lens wrapper (focal-power mode, diopter sweep)
+```

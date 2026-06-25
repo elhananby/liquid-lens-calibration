@@ -1,17 +1,20 @@
-"""Focus metric computation and best-focus parabola fit."""
+"""Focus metric computation and best-focus peak finding."""
 
 import time
+from collections import defaultdict
 
 import numpy as np
 import numpy.typing as npt
 import cv2
 
+from liquid_lens_calibration.triangulate import detect_apriltags, TAG_FAMILIES
+
 
 def focus_metric(patch: npt.NDArray[np.uint8]) -> float:
-    """Compute a focus metric on an image patch.
+    """Laplacian-of-Gaussian focus metric.
 
-    Uses variance of Laplacian — a simple, well-behaved contrast
-    measure. Higher values indicate sharper focus.
+    Applies a 3×3 Gaussian blur before the Laplacian to reduce high-frequency
+    noise sensitivity (Bonatti 2024, §5.2.3). Higher values indicate sharper focus.
 
     Args:
         patch: Grayscale image patch.
@@ -19,21 +22,63 @@ def focus_metric(patch: npt.NDArray[np.uint8]) -> float:
     Returns:
         Scalar focus metric.
     """
-    laplacian = cv2.Laplacian(patch, cv2.CV_64F)
-    return float(laplacian.var())
+    blurred = cv2.GaussianBlur(patch, (3, 3), 0)
+    log = cv2.Laplacian(blurred, cv2.CV_64F)
+    return float(log.var())
+
+
+def _gaussian_log_peak(
+    d_prev: float,
+    d_m: float,
+    d_next: float,
+    f_prev: float,
+    f_m: float,
+    f_next: float,
+) -> float:
+    """Sub-step peak diopter via Gaussian interpolation in log-space.
+
+    Models the focus curve as F = F_p * exp(-½ ((d−d̄)/σ)²). With three
+    uniformly-spaced samples the peak d̄ has a closed-form solution
+    (Bonatti 2024, eq. 3.9).
+
+    Args:
+        d_prev, d_m, d_next: Uniformly-spaced diopter values (d_prev < d_m < d_next).
+        f_prev, f_m, f_next: Corresponding focus metrics (must all be > 0).
+
+    Returns:
+        Interpolated peak diopter, clamped to [d_prev, d_next].
+        Falls back to d_m if the denominator is near zero.
+    """
+    ln_prev = np.log(max(f_prev, 1e-12))
+    ln_m    = np.log(max(f_m,    1e-12))
+    ln_next = np.log(max(f_next, 1e-12))
+
+    delta = d_m - d_prev  # uniform step (positive)
+
+    numerator = (
+        (ln_m - ln_next) * (d_m ** 2 - d_prev ** 2)
+        - (ln_m - ln_prev) * (d_m ** 2 - d_next ** 2)
+    )
+    denominator = 2.0 * delta * ((ln_m - ln_prev) + (ln_m - ln_next))
+
+    if abs(denominator) < 1e-12:
+        return float(d_m)
+
+    return float(np.clip(numerator / denominator, d_prev, d_next))
 
 
 def fit_parabola(
-    xs: npt.NDArray[np.float64], ys: npt.NDArray[np.float64]
+    xs: npt.NDArray[np.float64],
+    ys: npt.NDArray[np.float64],
 ) -> tuple[float, float, float]:
     """Fit a parabola ``y = a*(x - x0)^2 + y0`` by least squares.
 
     Args:
-        xs: Independent variable values (e.g. diopter steps).
-        ys: Dependent variable values (e.g. focus metrics).
+        xs: Independent variable values.
+        ys: Dependent variable values.
 
     Returns:
-        ``(x0, y0, a)`` — vertex ``(x0, y0)`` and curvature ``a``.
+        ``(x0, y0, a)`` — vertex coordinates and curvature.
     """
     A = np.column_stack([xs * xs, xs, np.ones_like(xs)])
     coeffs, *_ = np.linalg.lstsq(A, ys, rcond=None)
@@ -43,55 +88,170 @@ def fit_parabola(
     return x0, y0, a2
 
 
-def sweep_and_find_peak(
+def _bounding_box_from_corners(
+    corners: npt.NDArray[np.float64],
+    pad: int,
+    frame_h: int,
+    frame_w: int,
+) -> tuple[int, int, int, int]:
+    """Return an ``(x, y, w, h)`` ROI around tag corners, clamped to the frame."""
+    x_min = int(np.floor(corners[:, 0].min())) - pad
+    y_min = int(np.floor(corners[:, 1].min())) - pad
+    x_max = int(np.ceil(corners[:, 0].max())) + pad
+    y_max = int(np.ceil(corners[:, 1].max())) + pad
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(frame_w, x_max)
+    y_max = min(frame_h, y_max)
+    return x_min, y_min, x_max - x_min, y_max - y_min
+
+
+def _find_peak(
+    ds: list[float],
+    ms: list[float],
+    peak_idx: int,
+    d_min: float,
+    d_max: float,
+) -> float:
+    """Resolve the sub-step peak diopter from a discrete focus curve.
+
+    Cascade: Gaussian log interpolation → parabola fit → argmax.
+    """
+    n = len(ds)
+    xs = np.array(ds, dtype=np.float64)
+    ys = np.array(ms, dtype=np.float64)
+
+    # 1. Gaussian log interpolation (needs a neighbour on each side, all > 0)
+    if 0 < peak_idx < n - 1:
+        f_prev = ms[peak_idx - 1]
+        f_m    = ms[peak_idx]
+        f_next = ms[peak_idx + 1]
+        if f_prev > 0 and f_m > 0 and f_next > 0:
+            d_est = _gaussian_log_peak(
+                ds[peak_idx - 1], ds[peak_idx], ds[peak_idx + 1],
+                f_prev, f_m, f_next,
+            )
+            if d_min <= d_est <= d_max:
+                return d_est
+
+    # 2. Parabola fit over a window around the peak
+    half = max(2, n // 6)
+    left  = max(0, peak_idx - half)
+    right = min(n, peak_idx + half + 1)
+    if right - left >= 3:
+        x0, _y0, a = fit_parabola(xs[left:right], ys[left:right])
+        if a < 0 and d_min <= x0 <= d_max:
+            return x0
+
+    # 3. Argmax fallback
+    return float(ds[peak_idx])
+
+
+def sweep_all_tags(
     lens,
     focus_cam,
-    roi: tuple[int, int, int, int],
+    tag_family: str,
     diopter_range: tuple[float, float],
-    n_steps: int = 30,
+    n_coarse: int = 20,
+    n_fine: int = 20,
     settle_s: float = 0.05,
-) -> tuple[float, float, float, list[float], list[float]]:
-    """Sweep the lens across its diopter range and find best focus.
+) -> dict[int, tuple[float, float, float, list[float], list[float]]]:
+    """Sweep the liquid lens and find the best-focus diopter for each tag.
 
-    For each step: set diopter, wait a brief settle, grab a focus frame,
-    crop to ROI, compute the focus metric. After the sweep, fit a parabola
-    to the data near the metric peak and return the vertex diopter.
+    **Coarse pass** — sweeps the full diopter range. At each step the XIMEA
+    frame is grabbed and AprilTags are detected; per-tag bounding-box ROIs are
+    tracked and focus metrics computed. Tags that are not detectable at a given
+    diopter are still measured using their last known ROI.
+
+    **Fine pass** — for each tag, sweeps a narrow window (±2 coarse steps)
+    around its coarse peak and resolves the sub-step best diopter using
+    Gaussian log interpolation (Bonatti 2024, eq. 3.9).
 
     Args:
-        lens: Optotune lens instance (must be in focal-power mode).
-        focus_cam: :class:`XimeaFocusCamera` instance.
-        roi: ``(x, y, w, h)`` ROI for the focus metric.
+        lens: Optotune lens instance.
+        focus_cam: :class:`~liquid_lens_calibration.focus_camera.XimeaFocusCamera`.
+        tag_family: Key into :data:`~liquid_lens_calibration.triangulate.TAG_FAMILIES`.
         diopter_range: ``(min_diopter, max_diopter)``.
-        n_steps: Number of diopter steps in the sweep.
-        settle_s: Seconds to wait after setting diopter before grabbing frame.
+        n_coarse: Steps in the coarse sweep.
+        n_fine: Steps in the fine sweep per tag.
+        settle_s: Seconds to wait after each diopter change.
 
     Returns:
-        ``(best_diopter, peak_metric, curvature, diopters_list, metrics_list)``.
+        ``{tag_id: (best_diopter, peak_metric, curvature, all_diopters, all_metrics)}``.
+        Only tags detected in the XIMEA during the coarse sweep are returned.
+        Returns an empty dict if no tags were found.
     """
     d_min, d_max = diopter_range
-    diopters = np.linspace(d_min, d_max, n_steps, dtype=np.float64)
-    metrics: list[float] = []
+    dictionary_type = TAG_FAMILIES.get(tag_family, cv2.aruco.DICT_APRILTAG_36H11)
 
-    for d in diopters:
+    per_tag_roi: dict[int, tuple[int, int, int, int]] = {}
+    per_tag_meas: dict[int, list[tuple[float, float]]] = defaultdict(list)
+
+    # --- Coarse sweep ---
+    for d in np.linspace(d_min, d_max, n_coarse):
         lens.set_diopter(float(d))
         time.sleep(settle_s)
-        patch = focus_cam.grab_roi_frame(roi)
-        m = focus_metric(patch)
-        metrics.append(m)
+        frame = focus_cam.grab_full_frame()
+        frame_h, frame_w = frame.shape[:2]
 
-    # Find the argmax region and fit parabola around it
-    xs = np.array(diopters, dtype=np.float64)
-    ys = np.array(metrics, dtype=np.float64)
-    peak_idx = int(np.argmax(ys))
+        corners_list, ids = detect_apriltags(frame, dictionary_type)
+        seen_this_step: set[int] = set()
 
-    # Take a window around the peak (at least 3 points for a 3-param fit)
-    half_window = max(2, n_steps // 6)
-    left = max(0, peak_idx - half_window)
-    right = min(len(xs), peak_idx + half_window + 1)
+        if ids is not None:
+            for i, tag_id in enumerate(ids.flatten()):
+                tid = int(tag_id)
+                corners_4 = corners_list[i].reshape(4, 2)
+                roi = _bounding_box_from_corners(
+                    corners_4, pad=10, frame_h=frame_h, frame_w=frame_w
+                )
+                if roi[2] > 0 and roi[3] > 0:
+                    per_tag_roi[tid] = roi
 
-    if right - left < 3:
-        # Fall back to argmax if window is too small
-        return float(xs[peak_idx]), float(ys[peak_idx]), 0.0, diopters.tolist(), metrics
+                if tid in per_tag_roi:
+                    x, y, bw, bh = per_tag_roi[tid]
+                    patch = frame[y : y + bh, x : x + bw]
+                    per_tag_meas[tid].append((float(d), focus_metric(patch)))
+                    seen_this_step.add(tid)
 
-    x0, y0, a = fit_parabola(xs[left:right], ys[left:right])
-    return x0, y0, a, diopters.tolist(), metrics
+        # Tags with a known ROI but not detected this step
+        for tid, (x, y, bw, bh) in per_tag_roi.items():
+            if tid not in seen_this_step:
+                patch = frame[y : y + bh, x : x + bw]
+                per_tag_meas[tid].append((float(d), focus_metric(patch)))
+
+    if not per_tag_meas:
+        return {}
+
+    coarse_step = (d_max - d_min) / max(n_coarse - 1, 1)
+    results: dict[int, tuple[float, float, float, list[float], list[float]]] = {}
+
+    # --- Per-tag fine sweep ---
+    for tag_id, meas in per_tag_meas.items():
+        roi = per_tag_roi.get(tag_id)
+        if roi is None:
+            continue
+
+        ds_c = [m[0] for m in meas]
+        ms_c = [m[1] for m in meas]
+        coarse_peak_d = ds_c[int(np.argmax(ms_c))]
+
+        fine_half = 2.0 * coarse_step
+        fine_min = max(d_min, coarse_peak_d - fine_half)
+        fine_max = min(d_max, coarse_peak_d + fine_half)
+
+        ds_f: list[float] = []
+        ms_f: list[float] = []
+        for d in np.linspace(fine_min, fine_max, n_fine):
+            lens.set_diopter(float(d))
+            time.sleep(settle_s)
+            patch = focus_cam.grab_roi_frame(roi)
+            ds_f.append(float(d))
+            ms_f.append(focus_metric(patch))
+
+        fine_peak_idx = int(np.argmax(ms_f))
+        best_d = _find_peak(ds_f, ms_f, fine_peak_idx, d_min, d_max)
+        peak_m = float(ms_f[fine_peak_idx])
+
+        results[tag_id] = (best_d, peak_m, 0.0, ds_c + ds_f, ms_c + ms_f)
+
+    return results
