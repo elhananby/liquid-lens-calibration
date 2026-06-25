@@ -81,18 +81,20 @@ def _gaussian_log_peak(
     (Bonatti 2024, eq. 3.9).
 
     Args:
-        d_prev, d_m, d_next: Uniformly-spaced diopter values (d_prev < d_m < d_next).
+        d_prev, d_m, d_next: Uniformly-spaced diopter values. May be in either
+            increasing (lo→hi sweep) or decreasing (hi→lo sweep) order — the
+            formula is algebraically invariant to reversal.
         f_prev, f_m, f_next: Corresponding focus metrics (must all be > 0).
 
     Returns:
-        Interpolated peak diopter, clamped to [d_prev, d_next].
+        Interpolated peak diopter, clamped to [min(d_prev,d_next), max(d_prev,d_next)].
         Falls back to d_m if the denominator is near zero.
     """
     ln_prev = np.log(max(f_prev, 1e-12))
     ln_m    = np.log(max(f_m,    1e-12))
     ln_next = np.log(max(f_next, 1e-12))
 
-    delta = d_m - d_prev  # uniform step (positive)
+    delta = d_m - d_prev  # step size (negative when sweep is hi→lo)
 
     numerator = (
         (ln_m - ln_next) * (d_m ** 2 - d_prev ** 2)
@@ -103,7 +105,12 @@ def _gaussian_log_peak(
     if abs(denominator) < 1e-12:
         return float(d_m)
 
-    return float(np.clip(numerator / denominator, d_prev, d_next))
+    # Use min/max so clip bounds are valid regardless of sweep direction.
+    # np.clip(x, a, b) is undefined when a > b; the hi→lo sweep gives
+    # d_prev > d_next, so without this guard the result is always clamped to d_next.
+    d_lo = min(d_prev, d_next)
+    d_hi = max(d_prev, d_next)
+    return float(np.clip(numerator / denominator, d_lo, d_hi))
 
 
 def fit_parabola(
@@ -350,6 +357,12 @@ def sweep_all_tags(
         fine_min = max(d_min, coarse_peak_d - fine_half)
         fine_max = min(d_max, coarse_peak_d + fine_half)
 
+        # Pre-settle at fine_max before the hi→lo sweep. The coarse sweep ends
+        # at d_max (e.g. 4.34 D); the jump to fine_max can be several diopters
+        # and the lens needs time to fully equilibrate before measurements begin.
+        lens.set_diopter(float(fine_max))
+        time.sleep(max(settle_s * 10, 1.0))
+
         # Fine sweep pass 1: high → low diopter
         ds_hi2lo: list[float] = []
         ms_hi2lo: list[float] = []
@@ -370,8 +383,9 @@ def sweep_all_tags(
                          f"({_step_j + 1}/{n_fine})  metric={m:.0f}")
             cv2.waitKey(1)
 
-        # Short pause between directions
-        time.sleep(max(settle_s * 5, 0.3))
+        # Pre-settle at fine_min before the lo→hi sweep.
+        lens.set_diopter(float(fine_min))
+        time.sleep(max(settle_s * 10, 1.0))
 
         # Fine sweep pass 2: low → high diopter
         ds_lo2hi: list[float] = []
