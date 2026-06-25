@@ -40,6 +40,7 @@ uv run lens-calibrate [options]
 | `--settle-ms` | `50` | Wait after each diopter change (ms) |
 | `--z-thresh` | `0.02` | Max z-spread (m) to treat tags as coplanar |
 | `--tag-family` | `36h11` | AprilTag family (`36h11`, `25h9`, …) |
+| `--debug` | off | Save focus-curve plots and ROI crops to `./debug/` after each sweep |
 
 ## Procedure
 

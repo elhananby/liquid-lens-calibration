@@ -11,6 +11,7 @@ Usage::
 import argparse
 import csv
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -81,6 +82,15 @@ def parse_args() -> argparse.Namespace:
         choices=list(TAG_FAMILIES),
         help="Marker dictionary to use for detection (default: %(default)s)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Save a focus-curve plot and ROI crop for each tag after every sweep. "
+            "Files are written to ./debug/ as debug_tag<id>_<time>_curve.png "
+            "and debug_tag<id>_<time>_roi.jpg."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,6 +112,8 @@ def main() -> None:
             print(f"Optotune lens diopter range: {d_min:.2f} to {d_max:.2f} D")
             print(f"Coarse steps: {args.coarse_steps}  Fine steps: {args.fine_steps}")
             print(f"Tags within {args.z_thresh * 1000:.0f} mm z-spread → coplanar (z fused)")
+            if args.debug:
+                print(f"Debug mode ON — plots and ROI crops saved to ./debug/")
 
             print("\n" + "=" * 60)
             print("Calibration loop")
@@ -159,6 +171,8 @@ def main() -> None:
                     n_coarse=args.coarse_steps,
                     n_fine=args.fine_steps,
                     settle_s=settle_s,
+                    debug=args.debug,
+                    debug_dir=Path("debug"),
                 )
 
                 if not sweep_results:

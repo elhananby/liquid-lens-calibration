@@ -2,6 +2,8 @@
 
 import time
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -147,6 +149,48 @@ def _find_peak(
     return float(ds[peak_idx])
 
 
+def _save_debug_outputs(
+    tag_id: int,
+    ds_c: list[float],
+    ms_c: list[float],
+    ds_f: list[float],
+    ms_f: list[float],
+    best_d: float,
+    peak_m: float,
+    roi_patch: npt.NDArray[np.uint8],
+    debug_dir: Path,
+    timestamp: str,
+) -> None:
+    """Save focus-curve plot and ROI crop for one tag."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    stem = f"debug_tag{tag_id}_{timestamp}"
+
+    # --- Focus curve plot ---
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(ds_c, ms_c, "o-", color="steelblue", markersize=4, label="coarse")
+    ax.plot(ds_f, ms_f, "s-", color="darkorange", markersize=4, label="fine")
+    ax.axvline(best_d, color="red", linestyle="--", linewidth=1.5,
+               label=f"best = {best_d:.3f} D")
+    ax.set_xlabel("Diopter (D)")
+    ax.set_ylabel("Focus metric (LoG variance)")
+    ax.set_title(f"Tag {tag_id}  —  best focus {best_d:.3f} D  (peak metric {peak_m:.1f})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plot_path = debug_dir / f"{stem}_curve.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"    [debug] curve  → {plot_path}")
+
+    # --- ROI crop ---
+    roi_path = debug_dir / f"{stem}_roi.jpg"
+    cv2.imwrite(str(roi_path), roi_patch)
+    print(f"    [debug] ROI    → {roi_path}")
+
+
 def sweep_all_tags(
     lens,
     focus_cam,
@@ -155,6 +199,8 @@ def sweep_all_tags(
     n_coarse: int = 20,
     n_fine: int = 20,
     settle_s: float = 0.05,
+    debug: bool = False,
+    debug_dir: Path | None = None,
 ) -> dict[int, tuple[float, float, float, list[float], list[float]]]:
     """Sweep the liquid lens and find the best-focus diopter for each tag.
 
@@ -175,6 +221,8 @@ def sweep_all_tags(
         n_coarse: Steps in the coarse sweep.
         n_fine: Steps in the fine sweep per tag.
         settle_s: Seconds to wait after each diopter change.
+        debug: If ``True``, save a focus-curve plot and ROI crop per tag.
+        debug_dir: Directory for debug files. Defaults to ``./debug``.
 
     Returns:
         ``{tag_id: (best_diopter, peak_metric, curvature, all_diopters, all_metrics)}``.
@@ -183,6 +231,11 @@ def sweep_all_tags(
     """
     d_min, d_max = diopter_range
     dictionary_type = TAG_FAMILIES.get(tag_family, cv2.aruco.DICT_APRILTAG_36H11)
+
+    if debug:
+        out_dir = debug_dir if debug_dir is not None else Path("debug")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S")
 
     per_tag_roi: dict[int, tuple[int, int, int, int]] = {}
     per_tag_meas: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -241,17 +294,26 @@ def sweep_all_tags(
 
         ds_f: list[float] = []
         ms_f: list[float] = []
+        peak_frame: npt.NDArray[np.uint8] | None = None
         for d in np.linspace(fine_min, fine_max, n_fine):
             lens.set_diopter(float(d))
             time.sleep(settle_s)
             patch = focus_cam.grab_roi_frame(roi)
             ds_f.append(float(d))
             ms_f.append(focus_metric(patch))
+            if len(ms_f) == 1 or ms_f[-1] >= max(ms_f[:-1]):
+                peak_frame = patch
 
         fine_peak_idx = int(np.argmax(ms_f))
         best_d = _find_peak(ds_f, ms_f, fine_peak_idx, d_min, d_max)
         peak_m = float(ms_f[fine_peak_idx])
 
         results[tag_id] = (best_d, peak_m, 0.0, ds_c + ds_f, ms_c + ms_f)
+
+        if debug and peak_frame is not None:
+            _save_debug_outputs(
+                tag_id, ds_c, ms_c, ds_f, ms_f,
+                best_d, peak_m, peak_frame, out_dir, ts,
+            )
 
     return results
