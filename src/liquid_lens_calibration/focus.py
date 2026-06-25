@@ -4,12 +4,28 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import numpy.typing as npt
 import cv2
 
 from liquid_lens_calibration.triangulate import detect_apriltags, TAG_FAMILIES
+
+# Matplotlib is imported lazily (only when debug=True) but the backend must be
+# set before pyplot is ever loaded, so we do it at module import time.
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+class _Lens(Protocol):
+    def set_diopter(self, value: float) -> None: ...
+
+
+class _FocusCam(Protocol):
+    def grab_full_frame(self) -> npt.NDArray[np.uint8]: ...
+    def grab_roi_frame(self, roi: tuple[int, int, int, int]) -> npt.NDArray[np.uint8]: ...
 
 PREVIEW_WIN = "XIMEA Live"
 HYSTERESIS_THRESH = 0.1  # diopters — warn if the two fine-sweep directions disagree more than this
@@ -141,8 +157,6 @@ def _find_peak(
     Cascade: Gaussian log interpolation → parabola fit → argmax.
     """
     n = len(ds)
-    xs = np.array(ds, dtype=np.float64)
-    ys = np.array(ms, dtype=np.float64)
 
     # 1. Gaussian log interpolation (needs a neighbour on each side, all > 0)
     if 0 < peak_idx < n - 1:
@@ -158,6 +172,8 @@ def _find_peak(
                 return d_est
 
     # 2. Parabola fit over a window around the peak
+    xs = np.array(ds, dtype=np.float64)
+    ys = np.array(ms, dtype=np.float64)
     half = max(2, n // 6)
     left  = max(0, peak_idx - half)
     right = min(n, peak_idx + half + 1)
@@ -187,10 +203,6 @@ def _save_debug_outputs(
     timestamp: str,
 ) -> None:
     """Save focus-curve plot (coarse + both fine directions) and ROI crop for one tag."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     stem = f"debug_tag{tag_id}_{timestamp}"
     hysteresis = abs(best_d_hi2lo - best_d_lo2hi)
 
@@ -224,8 +236,8 @@ def _save_debug_outputs(
 
 
 def sweep_all_tags(
-    lens,
-    focus_cam,
+    lens: _Lens,
+    focus_cam: _FocusCam,
     tag_family: str,
     diopter_range: tuple[float, float],
     n_coarse: int = 20,
@@ -233,7 +245,7 @@ def sweep_all_tags(
     settle_s: float = 0.05,
     debug: bool = False,
     debug_dir: Path | None = None,
-) -> dict[int, tuple[float, float, float, list[float], list[float]]]:
+) -> dict[int, tuple[float, float, float, float, list[float], list[float]]]:
     """Sweep the liquid lens and find the best-focus diopter for each tag.
 
     **Coarse pass** — sweeps the full diopter range. At each step the XIMEA
@@ -242,8 +254,8 @@ def sweep_all_tags(
     diopter are still measured using their last known ROI.
 
     **Fine pass** — for each tag, sweeps a narrow window (±2 coarse steps)
-    around its coarse peak and resolves the sub-step best diopter using
-    Gaussian log interpolation (Bonatti 2024, eq. 3.9).
+    around its coarse peak in both directions (hi→lo then lo→hi) to capture
+    hysteresis. Both per-direction peaks and their average are returned.
 
     Args:
         lens: Optotune lens instance.
@@ -257,17 +269,18 @@ def sweep_all_tags(
         debug_dir: Directory for debug files. Defaults to ``./debug``.
 
     Returns:
-        ``{tag_id: (best_diopter, peak_metric, curvature, all_diopters, all_metrics)}``.
+        ``{tag_id: (best_diopter_avg, best_d_hi2lo, best_d_lo2hi,
+        peak_metric, all_diopters, all_metrics)}``.
         Only tags detected in the XIMEA during the coarse sweep are returned.
         Returns an empty dict if no tags were found.
     """
     d_min, d_max = diopter_range
     dictionary_type = TAG_FAMILIES.get(tag_family, cv2.aruco.DICT_APRILTAG_36H11)
 
+    out_dir = debug_dir if debug_dir is not None else Path("debug")
+    ts = datetime.now().strftime("%H%M%S")
     if debug:
-        out_dir = debug_dir if debug_dir is not None else Path("debug")
         out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%H%M%S")
 
     per_tag_roi: dict[int, tuple[int, int, int, int]] = {}
     per_tag_meas: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -398,7 +411,7 @@ def sweep_all_tags(
 
         all_ds = ds_c + ds_hi2lo + ds_lo2hi
         all_ms = ms_c + ms_hi2lo + ms_lo2hi
-        results[tag_id] = (best_d, peak_m, 0.0, all_ds, all_ms)
+        results[tag_id] = (best_d, best_d_hi2lo, best_d_lo2hi, peak_m, all_ds, all_ms)
 
         if debug and peak_frame is not None:
             _save_debug_outputs(

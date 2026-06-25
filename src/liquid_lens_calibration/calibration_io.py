@@ -15,7 +15,7 @@ class CameraCalibration:
     calibration_matrix: npt.NDArray[np.float64]  # 3x4 world→pixel projection
     resolution: tuple[int, int]  # width, height in pixels
     intrinsics: tuple[float, float, float, float]  # fx, fy, cx, cy
-    distortion_coeffs: tuple[float, float, float, float, float]  # k1, k2, k3, p1, p2
+    distortion_coeffs: tuple[float, float, float, float, float]  # k1, k2, p1, p2, k3 (OpenCV order)
     alpha_c: float = 0.0
 
 

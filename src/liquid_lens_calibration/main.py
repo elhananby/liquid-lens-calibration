@@ -15,7 +15,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.optimize import curve_fit
 
 from liquid_lens_calibration.calibration_io import parse_calibration_xml
 from liquid_lens_calibration.cameras import discover_basler_cameras, grab_frame, flush_buffers as flush_basler
@@ -42,9 +41,11 @@ def _live_wait(focus_cam: XimeaFocusCamera) -> str:
             return "quit"
 
 
-def vergence_model(z: np.ndarray, a: float, z0: float, b: float) -> np.ndarray:
-    """Required diopter as a function of object distance (vergence model)."""
-    return a / (z - z0) + b
+_CALIB_DEFAULT = (
+    Path("calibration.xml")
+    if Path("calibration.xml").exists()
+    else Path("/home/nfc/braid-configs/calibration_charuco.xml")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--calibration",
-        default="/home/nfc/braid-configs/calibration_charuco.xml",
+        default=str(_CALIB_DEFAULT),
         help="Path to braid multi-camera calibration XML (default: %(default)s)",
     )
     parser.add_argument(
@@ -213,47 +214,53 @@ def main() -> None:
                     n_views = int(weights.sum())
 
                     # Pick the sweep result with the best (highest) metric peak
-                    best_tid = max(sweep_results, key=lambda t: sweep_results[t][1])
-                    best_d, peak_m, _curv, *_ = sweep_results[best_tid]
+                    best_tid = max(sweep_results, key=lambda t: sweep_results[t][3])
+                    best_d, best_d_hi2lo, best_d_lo2hi, peak_m, *_ = sweep_results[best_tid]
 
                     print(
                         f"  Best focus: {best_d:.3f} D  "
-                        f"(z={z_fused:.4f} m, metric peak={peak_m:.1f}, "
+                        f"(↓{best_d_hi2lo:.3f} ↑{best_d_lo2hi:.3f}, "
+                        f"z={z_fused:.4f} m, metric peak={peak_m:.1f}, "
                         f"{len(tag_results)} tag(s), {n_views} views)"
                     )
-                    dataset.append({
+                    base = {
                         "z": z_fused,
-                        "diopter": best_d,
                         "x": x_fused,
                         "y": y_fused,
                         "n_cameras": n_views,
                         "n_tags": len(tag_results),
                         "focus_metric_peak": peak_m,
                         "timestamp": timestamp,
-                    })
+                    }
+                    dataset.append({**base, "diopter": best_d_hi2lo, "sweep_direction": "hi2lo"})
+                    dataset.append({**base, "diopter": best_d_lo2hi, "sweep_direction": "lo2hi"})
 
                 else:
-                    # Multi-height: one data point per tag (XIMEA ∩ Basler)
+                    # Multi-height: two rows per tag (one per sweep direction)
                     added = 0
-                    for tid, (best_d, peak_m, _curv, *_) in sorted(sweep_results.items()):
+                    for tid, (best_d, best_d_hi2lo, best_d_lo2hi, peak_m, *_) in sorted(
+                        sweep_results.items()
+                    ):
                         if tid not in tag_results:
                             print(f"  Tag {tid} seen in XIMEA but not triangulated — skipping.")
                             continue
                         x, y, z, n_cam = tag_results[tid]
                         print(
-                            f"  Tag {tid}: z={z:.4f} m → {best_d:.3f} D  "
-                            f"(metric peak={peak_m:.1f}, {n_cam} cameras)"
+                            f"  Tag {tid}: z={z:.4f} m → avg {best_d:.3f} D  "
+                            f"(↓{best_d_hi2lo:.3f} ↑{best_d_lo2hi:.3f}, "
+                            f"metric peak={peak_m:.1f}, {n_cam} cameras)"
                         )
-                        dataset.append({
+                        base = {
                             "z": z,
-                            "diopter": best_d,
                             "x": x,
                             "y": y,
                             "n_cameras": n_cam,
                             "n_tags": 1,
                             "focus_metric_peak": peak_m,
                             "timestamp": timestamp,
-                        })
+                        }
+                        dataset.append({**base, "diopter": best_d_hi2lo, "sweep_direction": "hi2lo"})
+                        dataset.append({**base, "diopter": best_d_lo2hi, "sweep_direction": "lo2hi"})
                         added += 1
                     if added == 0:
                         print("  No matching tags between XIMEA and Basler — skipping.")
@@ -269,67 +276,37 @@ def main() -> None:
             except Exception:
                 pass
 
-    if len(dataset) < 3:
-        print(f"Only {len(dataset)} data point(s) — need at least 3 for a fit. No CSV written.")
+    if len(dataset) < 4:
+        print(f"Only {len(dataset)} data point(s) — need at least 4 (2 measurements × 2 directions). No CSV written.")
         return
 
     z_vals = np.array([d["z"] for d in dataset], dtype=np.float64)
     d_vals = np.array([d["diopter"] for d in dataset], dtype=np.float64)
 
-    print(f"\nFitting vergence model: D = a/(z - z0) + b")
+    print(f"\nFitting quadratic polynomial: D = a·z² + b·z + c")
     print(f"  {len(dataset)} data points  z=[{z_vals.min():.3f}, {z_vals.max():.3f}] m  "
           f"D=[{d_vals.min():.3f}, {d_vals.max():.3f}] diopter")
 
-    _fit_vergence(z_vals, d_vals)
+    _fit_polynomial(z_vals, d_vals)
 
     _write_csv(dataset)
 
 
-def _fit_vergence(z_vals: np.ndarray, d_vals: np.ndarray) -> None:
-    """Fit D = a/(z - z0) + b and print results.
+def _fit_polynomial(z_vals: np.ndarray, d_vals: np.ndarray) -> None:
+    """Fit D = a·z² + b·z + c and print results.
 
-    Tries several z0 starting points spread below z_min and picks the one
-    with the lowest residual RMS. A bound keeps z0 strictly below z_min so
-    the singularity never falls inside the data range.
+    A quadratic polynomial fits significantly better than the vergence model
+    (D = a/(z-z0) + b) over short z ranges (< 0.5 m) where the hyperbolic
+    curvature is indistinguishable from linear within measurement noise.
+    Use ``np.polyval(coefs, z)`` for real-time lookup.
     """
-    z_min = float(z_vals.min())
-    # z0 must stay below the smallest z value (singularity outside data range)
-    z0_upper_bound = z_min - 1e-3
-    bounds = ([-np.inf, -np.inf, -np.inf], [np.inf, z0_upper_bound, np.inf])
-
-    best_params: tuple[float, float, float] | None = None
-    best_rms = np.inf
-
-    # Try z0 candidates spread 0.01 m to 2 m below z_min
-    for z0_try in [z_min - v for v in (0.01, 0.05, 0.2, 0.5, 1.0, 2.0)]:
-        # Linear regression of D on 1/(z - z0_try) gives a and b directly
-        inv_z = 1.0 / (z_vals - z0_try)
-        a_try, b_try = float(np.polyfit(inv_z, d_vals, 1))
-        try:
-            (a_fit, z0_fit, b_fit), _ = curve_fit(
-                vergence_model, z_vals, d_vals,
-                p0=(a_try, z0_try, b_try),
-                bounds=bounds,
-                maxfev=10000,
-            )
-            residuals = d_vals - vergence_model(z_vals, a_fit, z0_fit, b_fit)
-            rms = float(np.sqrt(np.mean(residuals ** 2)))
-            if rms < best_rms:
-                best_rms = rms
-                best_params = (a_fit, z0_fit, b_fit)
-        except Exception:
-            continue
-
-    if best_params is None:
-        print("  Fit failed — could not converge from any starting point.")
-        print("  The CSV still contains the raw data for offline fitting.")
-        return
-
-    a_fit, z0_fit, b_fit = best_params
-    print(f"  a  = {a_fit:.4f}")
-    print(f"  z0 = {z0_fit:.4f}")
-    print(f"  b  = {b_fit:.4f}")
-    print(f"  Residual RMS = {best_rms:.4f} D")
+    coefs = np.polyfit(z_vals, d_vals, 2)
+    pred = np.polyval(coefs, z_vals)
+    rms = float(np.sqrt(np.mean((d_vals - pred) ** 2)))
+    a, b, c = coefs
+    print(f"  D = {a:.4f}·z² + {b:.4f}·z + ({c:.4f})")
+    print(f"  Residual RMS = {rms:.4f} D")
+    print(f"  coefs (for np.polyval) = [{a:.6f}, {b:.6f}, {c:.6f}]")
 
 
 def _write_csv(dataset: list[dict]) -> None:
@@ -338,7 +315,8 @@ def _write_csv(dataset: list[dict]) -> None:
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = f"lens_calib_{timestamp_str}.csv"
     fieldnames = [
-        "z", "diopter", "x", "y", "n_cameras", "n_tags", "focus_metric_peak", "timestamp"
+        "z", "diopter", "sweep_direction", "x", "y",
+        "n_cameras", "n_tags", "focus_metric_peak", "timestamp",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

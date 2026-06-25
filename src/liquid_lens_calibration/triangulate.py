@@ -6,6 +6,17 @@ import cv2
 
 from liquid_lens_calibration.calibration_io import CameraCalibration
 
+_detector_cache: dict[int, cv2.aruco.ArucoDetector] = {}
+
+
+def _get_detector(dictionary_type: int) -> cv2.aruco.ArucoDetector:
+    if dictionary_type not in _detector_cache:
+        d = cv2.aruco.getPredefinedDictionary(dictionary_type)
+        p = cv2.aruco.DetectorParameters()
+        _detector_cache[dictionary_type] = cv2.aruco.ArucoDetector(d, p)
+    return _detector_cache[dictionary_type]
+
+
 TAG_FAMILIES: dict[str, int] = {
     "36h11": cv2.aruco.DICT_APRILTAG_36H11,
     "36h10": cv2.aruco.DICT_APRILTAG_36H10,
@@ -54,7 +65,7 @@ def dlt_triangulate(
         projection_matrices: List of 3x4 world→pixel projection matrices, one per camera.
 
     Returns:
-        Homogeneous 4-vector or dehomogenized ``(x, y, z)``.
+        Dehomogenized ``[x, y, z, 1.0]`` (4-element array).
 
     Raises:
         ValueError: Fewer than 2 correspondences provided.
@@ -77,7 +88,7 @@ def dlt_triangulate(
 def detect_apriltags(
     gray: npt.NDArray[np.uint8],
     dictionary_type: int = cv2.aruco.DICT_APRILTAG_36H11,
-) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.int32]]:
+) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.int32] | None]:
     """Detect markers in a grayscale image.
 
     Args:
@@ -86,11 +97,9 @@ def detect_apriltags(
 
     Returns:
         ``(corners_list, ids)`` where each corner array has shape ``(4, 2)``.
+        ``ids`` is ``None`` when no markers are detected.
     """
-    dictionary = cv2.aruco.getPredefinedDictionary(dictionary_type)
-    params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(dictionary, params)
-    corners, ids, _ = detector.detectMarkers(gray)
+    corners, ids, _ = _get_detector(dictionary_type).detectMarkers(gray)
     return corners, ids
 
 

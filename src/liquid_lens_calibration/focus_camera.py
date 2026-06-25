@@ -15,8 +15,9 @@ class XimeaFocusCamera:
     Usage::
 
         with XimeaFocusCamera(exposure_us=10000) as cam:
-            roi = cam.select_roi()
-            frame = cam.grab_roi_frame(roi)
+            frame = cam.grab_full_frame()          # full sensor frame
+            roi = (x, y, w, h)                     # from AprilTag detection
+            patch = cam.grab_roi_frame(roi)        # cropped to focus region
     """
 
     def __init__(self, exposure_us: int = 10000) -> None:

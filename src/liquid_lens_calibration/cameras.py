@@ -60,8 +60,13 @@ def grab_frame(camera: pylon.InstantCamera) -> npt.NDArray[np.uint8]:
 
     Returns:
         2D grayscale numpy array.
+
+    Raises:
+        RuntimeError: If the grab fails (disconnect, timeout, etc.).
     """
     result = camera.GrabOne(5000)
+    if not result.GrabSucceeded():
+        raise RuntimeError(f"Basler grab failed: {result.GetErrorDescription()}")
     img = result.Array
     if img.ndim == 3:
         img = img if img.shape[2] == 1 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -76,4 +81,6 @@ def flush_buffers(camera: pylon.InstantCamera, n: int = 3) -> None:
         n: Number of frames to discard.
     """
     for _ in range(n):
-        camera.GrabOne(5000)
+        result = camera.GrabOne(1000)
+        if not result.GrabSucceeded():
+            break  # camera issue — stop flushing rather than spinning on errors
