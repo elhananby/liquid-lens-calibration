@@ -270,31 +270,66 @@ def main() -> None:
                 pass
 
     if len(dataset) < 3:
-        print(f"Only {len(dataset)} data point(s) — need at least 3 for a fit.")
-        _write_csv(dataset)
+        print(f"Only {len(dataset)} data point(s) — need at least 3 for a fit. No CSV written.")
         return
 
     z_vals = np.array([d["z"] for d in dataset], dtype=np.float64)
     d_vals = np.array([d["diopter"] for d in dataset], dtype=np.float64)
 
     print(f"\nFitting vergence model: D = a/(z - z0) + b")
-    print(f"  {len(dataset)} data points")
+    print(f"  {len(dataset)} data points  z=[{z_vals.min():.3f}, {z_vals.max():.3f}] m  "
+          f"D=[{d_vals.min():.3f}, {d_vals.max():.3f}] diopter")
 
-    p0 = (1.0, float(z_vals.min()) - 10.0, float(d_vals.mean()))
-    try:
-        (a_fit, z0_fit, b_fit), _ = curve_fit(
-            vergence_model, z_vals, d_vals, p0=p0, maxfev=10000
-        )
-        residuals = d_vals - vergence_model(z_vals, a_fit, z0_fit, b_fit)
-        rms = float(np.sqrt(np.mean(residuals ** 2)))
-        print(f"  a  = {a_fit:.4f}")
-        print(f"  z0 = {z0_fit:.4f}")
-        print(f"  b  = {b_fit:.4f}")
-        print(f"  Residual RMS = {rms:.4f} D")
-    except Exception as e:
-        print(f"  Fit failed: {e}")
+    _fit_vergence(z_vals, d_vals)
 
     _write_csv(dataset)
+
+
+def _fit_vergence(z_vals: np.ndarray, d_vals: np.ndarray) -> None:
+    """Fit D = a/(z - z0) + b and print results.
+
+    Tries several z0 starting points spread below z_min and picks the one
+    with the lowest residual RMS. A bound keeps z0 strictly below z_min so
+    the singularity never falls inside the data range.
+    """
+    z_min = float(z_vals.min())
+    # z0 must stay below the smallest z value (singularity outside data range)
+    z0_upper_bound = z_min - 1e-3
+    bounds = ([-np.inf, -np.inf, -np.inf], [np.inf, z0_upper_bound, np.inf])
+
+    best_params: tuple[float, float, float] | None = None
+    best_rms = np.inf
+
+    # Try z0 candidates spread 0.01 m to 2 m below z_min
+    for z0_try in [z_min - v for v in (0.01, 0.05, 0.2, 0.5, 1.0, 2.0)]:
+        # Linear regression of D on 1/(z - z0_try) gives a and b directly
+        inv_z = 1.0 / (z_vals - z0_try)
+        a_try, b_try = float(np.polyfit(inv_z, d_vals, 1))
+        try:
+            (a_fit, z0_fit, b_fit), _ = curve_fit(
+                vergence_model, z_vals, d_vals,
+                p0=(a_try, z0_try, b_try),
+                bounds=bounds,
+                maxfev=10000,
+            )
+            residuals = d_vals - vergence_model(z_vals, a_fit, z0_fit, b_fit)
+            rms = float(np.sqrt(np.mean(residuals ** 2)))
+            if rms < best_rms:
+                best_rms = rms
+                best_params = (a_fit, z0_fit, b_fit)
+        except Exception:
+            continue
+
+    if best_params is None:
+        print("  Fit failed — could not converge from any starting point.")
+        print("  The CSV still contains the raw data for offline fitting.")
+        return
+
+    a_fit, z0_fit, b_fit = best_params
+    print(f"  a  = {a_fit:.4f}")
+    print(f"  z0 = {z0_fit:.4f}")
+    print(f"  b  = {b_fit:.4f}")
+    print(f"  Residual RMS = {best_rms:.4f} D")
 
 
 def _write_csv(dataset: list[dict]) -> None:
