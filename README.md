@@ -84,7 +84,7 @@ re-fit the vergence model or use direct interpolation (e.g. `numpy.interp`).
 
 ## Algorithm
 
-- **Focus metric**: variance of Laplacian-of-Gaussian (3×3 Gaussian blur → Laplacian).
+- **Focus metric**: Tenengrad (mean squared Sobel gradient magnitude) — robust against bokeh artifacts on coarse targets like AprilTags.
 - **Peak finding**: Gaussian log-space 3-point interpolation for sub-step precision; parabola fit and argmax as fallbacks.
 - **Coarse sweep**: full diopter range, per-tag ROIs derived automatically from AprilTag detections in the XIMEA frame.
 - **Fine sweep**: ±2 coarse steps around each tag's coarse peak.

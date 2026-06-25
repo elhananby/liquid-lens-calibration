@@ -13,10 +13,11 @@ from liquid_lens_calibration.triangulate import detect_apriltags, TAG_FAMILIES
 
 
 def focus_metric(patch: npt.NDArray[np.uint8]) -> float:
-    """Laplacian-of-Gaussian focus metric.
+    """Tenengrad focus metric (mean squared Sobel gradient magnitude).
 
-    Applies a 3×3 Gaussian blur before the Laplacian to reduce high-frequency
-    noise sensitivity (Bonatti 2024, §5.2.3). Higher values indicate sharper focus.
+    Responds to edge sharpness and is robust against out-of-focus bokeh
+    artifacts that fool LoG on coarse targets like AprilTags. Higher values
+    indicate sharper focus.
 
     Args:
         patch: Grayscale image patch.
@@ -24,9 +25,9 @@ def focus_metric(patch: npt.NDArray[np.uint8]) -> float:
     Returns:
         Scalar focus metric.
     """
-    blurred = cv2.GaussianBlur(patch, (3, 3), 0)
-    log = cv2.Laplacian(blurred, cv2.CV_64F)
-    return float(log.var())
+    gx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch, cv2.CV_64F, 0, 1, ksize=3)
+    return float((gx ** 2 + gy ** 2).mean())
 
 
 def _gaussian_log_peak(
@@ -175,7 +176,7 @@ def _save_debug_outputs(
     ax.axvline(best_d, color="red", linestyle="--", linewidth=1.5,
                label=f"best = {best_d:.3f} D")
     ax.set_xlabel("Diopter (D)")
-    ax.set_ylabel("Focus metric (LoG variance)")
+    ax.set_ylabel("Focus metric (Tenengrad)")
     ax.set_title(f"Tag {tag_id}  —  best focus {best_d:.3f} D  (peak metric {peak_m:.1f})")
     ax.legend()
     ax.grid(True, alpha=0.3)
