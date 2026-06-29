@@ -77,13 +77,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fine-steps",
         type=int,
-        default=20,
+        default=40,
         help="Diopter steps in the fine sweep per tag (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--fine-repeats",
+        type=int,
+        default=1,
+        help="Number of times to repeat each fine sweep direction (default: %(default)s)",
     )
     parser.add_argument(
         "--settle-ms",
         type=int,
-        default=50,
+        default=100,
         help="Milliseconds to wait after setting diopter (default: %(default)s)",
     )
     parser.add_argument(
@@ -180,7 +186,7 @@ def main() -> None:
                 # Sweep lens — per-tag ROIs auto-detected from XIMEA
                 print(
                     f"  Sweeping: {args.coarse_steps} coarse + "
-                    f"{args.fine_steps} fine steps per tag …"
+                    f"{args.fine_steps} fine steps × {args.fine_repeats} repeat(s) per tag …"
                 )
                 sweep_results = sweep_all_tags(
                     lens,
@@ -189,6 +195,7 @@ def main() -> None:
                     (d_min, d_max),
                     n_coarse=args.coarse_steps,
                     n_fine=args.fine_steps,
+                    n_fine_repeats=args.fine_repeats,
                     settle_s=settle_s,
                     debug=args.debug,
                     debug_dir=Path("debug"),
