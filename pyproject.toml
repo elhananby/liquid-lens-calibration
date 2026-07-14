@@ -8,6 +8,12 @@ version = "0.1.0"
 description = "Build a z -> diopter lookup table for an Optotune liquid lens using a multi-camera Basler rig"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    { name = "Elhanan Buchsbaum", email = "ebuchsbaum@protonmail.com" },
+]
+maintainers = [
+    { name = "Elhanan Buchsbaum", email = "ebuchsbaum@protonmail.com" },
+]
 dependencies = [
     "numpy",
     "scipy",

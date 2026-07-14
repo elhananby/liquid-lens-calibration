@@ -47,6 +47,13 @@ _CALIB_DEFAULT = (
     else Path("/home/nfc/braid-configs/calibration_charuco.xml")
 )
 
+# The Optotune driver is open-loop (no internal position feedback). Per
+# Optotune, commanding a new focal power faster than ~25 ms means the lens
+# hasn't finished settling from the previous command, so the frame grabbed
+# at the "new" diopter is actually measuring a transient — silently
+# corrupting the focus curve. This is a hardware floor, not a tunable knob.
+_MIN_SETTLE_MS = 25
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -90,7 +97,12 @@ def parse_args() -> argparse.Namespace:
         "--settle-ms",
         type=int,
         default=100,
-        help="Milliseconds to wait after setting diopter (default: %(default)s)",
+        help=(
+            f"Milliseconds to wait after setting diopter (default: %(default)s). "
+            f"Must be >= {_MIN_SETTLE_MS} ms — the lens is open-loop and needs "
+            f"that long to physically settle; faster commands measure an "
+            f"unsettled transient."
+        ),
     )
     parser.add_argument(
         "--z-thresh",
@@ -116,7 +128,15 @@ def parse_args() -> argparse.Namespace:
             "and debug_tag<id>_<time>_roi.jpg."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.settle_ms < _MIN_SETTLE_MS:
+        parser.error(
+            f"--settle-ms {args.settle_ms} is below the lens's minimum settling "
+            f"time ({_MIN_SETTLE_MS} ms); the driver is open-loop, so faster "
+            f"commands would measure the lens mid-transient and corrupt the "
+            f"calibration."
+        )
+    return args
 
 
 def main() -> None:

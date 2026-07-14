@@ -36,8 +36,9 @@ uv run lens-calibrate [options]
 | `--port` | `/dev/optotune_ld` | Optotune lens serial port |
 | `--exposure` | `10000` | XIMEA exposure in µs |
 | `--coarse-steps` | `20` | Steps in the full-range diopter sweep |
-| `--fine-steps` | `20` | Steps in the narrow fine sweep per tag |
-| `--settle-ms` | `50` | Wait after each diopter change (ms) |
+| `--fine-steps` | `40` | Steps in the narrow fine sweep per tag |
+| `--fine-repeats` | `1` | Repeats per fine-sweep direction (hi→lo / lo→hi), for hysteresis stats |
+| `--settle-ms` | `100` | Wait after each diopter change (ms). Minimum 25 ms — the lens driver is open-loop and needs that long to physically settle; lower values are rejected |
 | `--z-thresh` | `0.02` | Max z-spread (m) to treat tags as coplanar |
 | `--tag-family` | `36h11` | AprilTag family (`36h11`, `25h9`, …) |
 | `--debug` | off | Save focus-curve plots and ROI crops to `./debug/` after each sweep |
@@ -68,26 +69,34 @@ auto-detected based on the spread of triangulated z values:
    - The lens performs a coarse sweep (full diopter range) while the XIMEA
      camera auto-detects tags and builds per-tag focus ROIs.
    - For each tag, a fine sweep refines the peak using Gaussian log-space
-     interpolation (Bonatti 2024, eq. 3.9).
+     interpolation (Bonatti 2024, eq. 3.9), swept both hi→lo and lo→hi to
+     characterize hysteresis (a warning is printed if the two directions
+     disagree by more than 0.1 D).
 4. Repeat for as many positions as needed.
-5. On quit, the vergence model `D = a/(z − z₀) + b` is fitted and a
-   timestamped CSV is written.
+5. On quit, a quadratic polynomial `D = a·z² + b·z + c` is fitted (found to
+   fit as well as the vergence model over the short z ranges involved, and
+   simpler to invert) and a timestamped CSV is written.
 
 ### Output
 
 CSV file: `lens_calib_YYYYMMDD_HHMMSS.csv`
 
-Columns: `z, diopter, x, y, n_cameras, n_tags, focus_metric_peak, timestamp`
+Columns: `z, diopter, sweep_direction, x, y, n_cameras, n_tags, focus_metric_peak, timestamp`
+
+Each measurement contributes two rows per tag — one per sweep direction
+(`hi2lo` / `lo2hi`) — so the fit sees both branches of the hysteresis loop.
 
 To interpolate diopter from `z` in real time, load the CSV and either
-re-fit the vergence model or use direct interpolation (e.g. `numpy.interp`).
+re-fit the polynomial (or the vergence model, if the runtime range grows
+large enough for its curvature to matter) or use direct interpolation
+(e.g. `numpy.interp`).
 
 ## Algorithm
 
 - **Focus metric**: Tenengrad (mean squared Sobel gradient magnitude) — robust against bokeh artifacts on coarse targets like AprilTags.
 - **Peak finding**: Gaussian log-space 3-point interpolation for sub-step precision; parabola fit and argmax as fallbacks.
 - **Coarse sweep**: full diopter range, per-tag ROIs derived automatically from AprilTag detections in the XIMEA frame.
-- **Fine sweep**: ±2 coarse steps around each tag's coarse peak.
+- **Fine sweep**: ±3 coarse steps around each tag's coarse peak, swept hi→lo then lo→hi (optionally repeated via `--fine-repeats`) to measure hysteresis.
 - **Triangulation**: DLT with SVD using the 3×4 world→pixel projection matrices from the braid calibration XML; pixels are undistorted with OpenCV before triangulation.
 
 ## Module layout
