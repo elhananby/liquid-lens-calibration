@@ -24,6 +24,31 @@ uv sync
 The `optotune-lens` package is sourced from `../optotune-lens` (local path).
 Basler Pylon SDK and XIMEA xiAPI runtime must be installed system-wide.
 
+## Getting Started
+
+The liquid lens focuses at a different real-world distance for every diopter
+value you command it to. This tool builds the lookup table between the two:
+it places an AprilTag at a known distance (measured by triangulating it with
+the six Basler cameras), sweeps the lens through its diopter range while
+watching a separate XIMEA camera behind the lens, and records the diopter at
+which that tag is sharpest. Do this at enough distances and a `z → diopter`
+curve is fit at the end — that curve is what a real application uses at
+runtime to autofocus.
+
+To run a calibration session:
+
+1. Place an AprilTag (family `36h11`) somewhere in view of the Basler rig.
+2. Start the tool: `uv run lens-calibrate`.
+3. Press **Enter** in the preview window — it triangulates the tag, sweeps
+   the lens, and records the best-focus diopter for that position.
+4. Move the tag to a new distance and press **Enter** again. Repeat for
+   ~10–15 positions spanning the range you care about.
+5. Press **q** + Enter to quit. This fits the `z → diopter` curve and writes
+   a timestamped CSV of every raw measurement.
+
+See [Procedure](#procedure) below for the full session walkthrough, and
+[Output](#output) for what's in the CSV.
+
 ## Usage
 
 ```bash
@@ -103,7 +128,7 @@ large enough for its curvature to matter) or use direct interpolation
 
 ```
 src/liquid_lens_calibration/
-├── main.py            CLI loop, CSV output, vergence model fit
+├── main.py            CLI loop, CSV output, polynomial fit
 ├── calibration_io.py  Parse braid XML → per-camera intrinsics + projection matrices
 ├── cameras.py         Basler camera discovery, frame grab, buffer flush
 ├── focus_camera.py    XIMEA camera (gain 0, user exposure, full/ROI frame grab)
